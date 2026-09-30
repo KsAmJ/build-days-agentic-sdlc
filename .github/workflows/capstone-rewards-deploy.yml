@@ -1,0 +1,391 @@
+name: Deploy capstone rewards-points to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      teamId:
+        description: Lowercase team identifier used by the approved Bicep deployment
+        required: true
+        type: string
+      pullRequestNumber:
+        description: Pull request whose current same-repository head is selected by --ref
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: capstone-rewards-deployment-${{ inputs.teamId }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: capstone/rewards-points
+
+jobs:
+  validate-linkage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    outputs:
+      pull_request_number: ${{ steps.validate.outputs.pull_request_number }}
+      required_checks: ${{ steps.validate.outputs.required_checks }}
+      security_checks: ${{ steps.validate.outputs.security_checks }}
+    steps:
+      - name: Validate pull request, commit, and checks
+        id: validate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pullRequestNumber }}
+          REPOSITORY: ${{ github.repository }}
+          DEPLOYED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::pullRequestNumber must be a positive integer."
+            exit 1
+          fi
+
+          pr="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/$REPOSITORY/pulls/$PR_NUMBER"
+          )"
+          head_sha="$(jq -r '.head.sha' <<< "$pr")"
+          head_repository="$(jq -r '.head.repo.full_name // empty' <<< "$pr")"
+          if [ "$head_repository" != "$REPOSITORY" ]; then
+            echo "::error::Pull request #$PR_NUMBER must use a branch in $REPOSITORY, not $head_repository."
+            exit 1
+          fi
+          if [ "$DEPLOYED_SHA" != "$head_sha" ]; then
+            echo "::error::Selected commit $DEPLOYED_SHA is not the current head $head_sha of pull request #$PR_NUMBER."
+            exit 1
+          fi
+
+          if ! required_checks="$(gh pr checks "$PR_NUMBER" --required \
+            --json name,state,workflow,bucket,link)"; then
+            echo "::error::One or more required pull-request checks have not passed."
+            exit 1
+          fi
+          if [ "$(jq 'length' <<< "$required_checks")" -eq 0 ]; then
+            echo "::error::No required pull-request checks were found. Configure branch protection before deployment."
+            exit 1
+          fi
+          if ! jq -e 'all(.[]; .bucket == "pass")' <<< "$required_checks" >/dev/null; then
+            echo "::error::Every required pull-request check must pass before deployment."
+            exit 1
+          fi
+
+          all_checks="$(gh pr checks "$PR_NUMBER" --json name,state,workflow,bucket,link)"
+          security_checks="$(
+            jq -c '
+              [.[] | select(
+                ((.workflow // "") | test("codeql|dependency review"; "i")) or
+                ((.name // "") | test("codeql|dependency review|analyze javascript"; "i"))
+              )]
+            ' <<< "$all_checks"
+          )"
+          if [ "$(jq 'length' <<< "$security_checks")" -gt 0 ] &&
+            ! jq -e 'all(.[]; .bucket == "pass")' <<< "$security_checks" >/dev/null; then
+            echo "::error::A security check is pending or failed."
+            exit 1
+          fi
+
+          required_summary="$(
+            jq -c '{
+              status: "passed",
+              count: length,
+              checks: map({name, workflow, state})
+            }' <<< "$required_checks"
+          )"
+          security_summary="$(
+            jq -c '{
+              status: (if length == 0 then "not_run" else "passed" end),
+              count: length,
+              checks: map({name, workflow, state})
+            }' <<< "$security_checks"
+          )"
+          echo "pull_request_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "required_checks=$required_summary" >> "$GITHUB_OUTPUT"
+          echo "security_checks=$security_summary" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: validate-linkage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: capstone-rewards
+      url: ${{ steps.infrastructure.outputs.application_url }}
+    outputs:
+      application_url: ${{ steps.infrastructure.outputs.application_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+          cache: npm
+          cache-dependency-path: capstone/rewards-points/package-lock.json
+      - name: Validate deployment inputs and OIDC configuration
+        shell: bash
+        env:
+          TEAM_ID: ${{ inputs.teamId }}
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TEAM_ID" =~ ^[a-z0-9][a-z0-9-]{1,18}[a-z0-9]$ ]]; then
+            echo "::error::teamId must be 3-20 lowercase letters, digits, or internal hyphens."
+            exit 1
+          fi
+          for name in CLIENT_ID TENANT_ID SUBSCRIPTION_ID RESOURCE_GROUP; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing environment variable $name. Configure OIDC and the protected capstone-rewards environment."
+              exit 1
+            fi
+          done
+      - name: Build and test application
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test
+          npm run build
+          npm prune --omit=dev
+      - name: Create deployment package
+        run: zip -r app.zip dist package.json package-lock.json node_modules
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Deploy infrastructure
+        id: infrastructure
+        shell: bash
+        env:
+          TEAM_ID: ${{ inputs.teamId }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+        run: |
+          set -euo pipefail
+          deployment="$(
+            az deployment group create \
+              --name "capstone-rewards-${GITHUB_RUN_ID}" \
+              --resource-group "$RESOURCE_GROUP" \
+              --template-file capstone/rewards-points/infra/main.bicep \
+              --parameters capstone/rewards-points/infra/main.example.bicepparam teamIdentifier="$TEAM_ID" \
+              --output json
+          )"
+          app_name="$(jq -r '.properties.outputs.appName.value // empty' <<< "$deployment")"
+          app_url="$(jq -r '.properties.outputs.appUrl.value // empty' <<< "$deployment")"
+          deployment_name="$(jq -r '.name // empty' <<< "$deployment")"
+          if [ -z "$app_name" ] || [ -z "$app_url" ] || [ -z "$deployment_name" ]; then
+            echo "::error::Azure deployment must return its name and Bicep outputs appName and appUrl."
+            exit 1
+          fi
+          echo "app_name=$app_name" >> "$GITHUB_OUTPUT"
+          echo "application_url=${app_url%/}" >> "$GITHUB_OUTPUT"
+          echo "deployment_name=$deployment_name" >> "$GITHUB_OUTPUT"
+      - name: Deploy application package
+        run: >
+          az webapp deploy
+          --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}"
+          --name "${{ steps.infrastructure.outputs.app_name }}"
+          --src-path app.zip
+          --type zip
+          --clean true
+          --restart true
+      - name: Verify deployed health, readiness, and API
+        id: verify
+        shell: bash
+        env:
+          APPLICATION_URL: ${{ steps.infrastructure.outputs.application_url }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..36}; do
+            if curl --fail --silent --show-error "$APPLICATION_URL/healthz" >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 36 ]; then
+              echo "::error::Deployment health check failed for six minutes."
+              exit 1
+            fi
+            sleep 10
+          done
+          curl --fail --silent --show-error "$APPLICATION_URL/readyz" >/dev/null
+          transaction_id="$(
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "Content-Type: application/json" \
+              --header "idempotency-key: deployment-${GITHUB_RUN_ID}" \
+              --data "{\"memberId\":\"mbr-ada\",\"points\":100,\"reason\":\"Deployment ${GITHUB_RUN_ID}\"}" \
+              "$APPLICATION_URL/api/transactions" |
+              jq -r '.transaction.id // empty'
+          )"
+          if [ -z "$transaction_id" ]; then
+            echo "::error::Transaction creation smoke test did not return an ID."
+            exit 1
+          fi
+          balance="$(
+            curl --fail --silent --show-error \
+              "$APPLICATION_URL/api/members/mbr-ada/balance" |
+              jq -r '.balance // empty'
+          )"
+          if [ -z "$balance" ] || [ "$balance" -lt 100 ]; then
+            echo "::error::Balance smoke test expected at least 100 and received '$balance'."
+            exit 1
+          fi
+          echo "health=true" >> "$GITHUB_OUTPUT"
+          echo "readiness=true" >> "$GITHUB_OUTPUT"
+          echo "transaction_creation=true" >> "$GITHUB_OUTPUT"
+          echo "balance_check=true" >> "$GITHUB_OUTPUT"
+      - name: Create machine-readable deployment evidence
+        id: evidence
+        shell: bash
+        env:
+          APPLICATION_URL: ${{ steps.infrastructure.outputs.application_url }}
+          AZURE_DEPLOYMENT: ${{ steps.infrastructure.outputs.deployment_name }}
+          PR_NUMBER: ${{ needs.validate-linkage.outputs.pull_request_number }}
+          REQUIRED_CHECKS: ${{ needs.validate-linkage.outputs.required_checks }}
+          SECURITY_CHECKS: ${{ needs.validate-linkage.outputs.security_checks }}
+          HEALTH: ${{ steps.verify.outputs.health }}
+          READINESS: ${{ steps.verify.outputs.readiness }}
+          TRANSACTION_CREATION: ${{ steps.verify.outputs.transaction_creation }}
+          BALANCE_CHECK: ${{ steps.verify.outputs.balance_check }}
+        run: |
+          set -euo pipefail
+          jq -c -n \
+            --arg commit_sha "$GITHUB_SHA" \
+            --argjson pull_request_number "$PR_NUMBER" \
+            --argjson required_checks "$REQUIRED_CHECKS" \
+            --argjson security_checks "$SECURITY_CHECKS" \
+            --arg azure_deployment "$AZURE_DEPLOYMENT" \
+            --arg github_run_id "$GITHUB_RUN_ID" \
+            --arg workflow_run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg environment "capstone-rewards" \
+            --arg application_url "$APPLICATION_URL" \
+            --argjson health "$HEALTH" \
+            --argjson readiness "$READINESS" \
+            --argjson transaction_creation "$TRANSACTION_CREATION" \
+            --argjson balance_check "$BALANCE_CHECK" \
+            '{
+              schema_version: 1,
+              commit_sha: $commit_sha,
+              pull_request_number: $pull_request_number,
+              required_checks: $required_checks,
+              security_checks: $security_checks,
+              azure: {
+                deployment_name: $azure_deployment,
+                github_run_id: $github_run_id
+              },
+              environment: $environment,
+              application_url: $application_url,
+              verification: {
+                health: $health,
+                readiness: $readiness,
+                transaction_creation: $transaction_creation,
+                balance_check: $balance_check
+              },
+              workflow_run_url: $workflow_run_url
+            }' > deployment-evidence.json
+          jq -e '
+            .schema_version == 1 and
+            (.commit_sha | test("^[0-9a-f]{40}$")) and
+            (.pull_request_number > 0) and
+            .required_checks.status == "passed" and
+            (.security_checks.status == "passed" or .security_checks.status == "not_run") and
+            (.azure.deployment_name | length > 0) and
+            .environment == "capstone-rewards" and
+            (.application_url | test("^https://")) and
+            ([.verification[]] | all) and
+            (.workflow_run_url | length > 0)
+          ' deployment-evidence.json >/dev/null
+      - name: Upload deployment evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: capstone-rewards-evidence-pr-${{ needs.validate-linkage.outputs.pull_request_number }}-${{ github.sha }}
+          path: capstone/rewards-points/deployment-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Summarize verified deployment
+        env:
+          APPLICATION_URL: ${{ steps.infrastructure.outputs.application_url }}
+          PR_NUMBER: ${{ needs.validate-linkage.outputs.pull_request_number }}
+        run: |
+          {
+            echo "## Verified capstone rewards-points deployment"
+            echo "- Pull request: #$PR_NUMBER"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Environment: \`capstone-rewards\`"
+            echo "- URL: $APPLICATION_URL"
+            echo "- Azure deployment: \`${{ steps.infrastructure.outputs.deployment_name }}\`"
+            echo "- Evidence artifact uploaded after health, readiness, and API smoke checks passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload deployment package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capstone-rewards-package-${{ github.sha }}
+          path: capstone/rewards-points/app.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-evidence:
+    needs: [validate-linkage, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Download deployment evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: capstone-rewards-evidence-pr-${{ needs.validate-linkage.outputs.pull_request_number }}-${{ github.sha }}
+          path: deployment-evidence
+      - name: Create or update pull-request evidence comment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.validate-linkage.outputs.pull_request_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          evidence_path="deployment-evidence/deployment-evidence.json"
+          jq -e '.verification | [.[]] | all' "$evidence_path" >/dev/null
+
+          marker="<!-- capstone-rewards-deployment-evidence -->"
+          application_url="$(jq -r '.application_url' "$evidence_path")"
+          commit_sha="$(jq -r '.commit_sha' "$evidence_path")"
+          deployment_name="$(jq -r '.azure.deployment_name' "$evidence_path")"
+          security_status="$(jq -r '.security_checks.status' "$evidence_path")"
+          run_url="$(jq -r '.workflow_run_url' "$evidence_path")"
+          body="$marker
+          ## Verified capstone rewards-points deployment evidence
+          - Commit: \`$commit_sha\`
+          - Environment: \`capstone-rewards\`
+          - Azure deployment: \`$deployment_name\`
+          - Live checks: health, readiness, transaction creation, and balance passed
+          - Security checks: \`$security_status\`
+          - Application: $application_url
+          - [Workflow run and evidence artifact]($run_url)"
+
+          comment_id="$(
+            gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+              --jq ".[] | select(.body | contains(\"$marker\")) | .id" |
+              head -n 1
+          )"
+          payload="$(jq -n --arg body "$body" '{body: $body}')"
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$REPOSITORY/issues/comments/$comment_id" --input - <<< "$payload"
+          else
+            gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --input - <<< "$payload"
+          fi
