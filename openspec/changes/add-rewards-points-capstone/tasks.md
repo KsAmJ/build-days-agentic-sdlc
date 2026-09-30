@@ -76,7 +76,7 @@
 
 ## 8. Defect loop (owner: defect-fix; depends on 7)
 
-- [ ] 8.1 File a bounded bug issue reproducing balance/selection by list
+- [x] 8.1 File a bounded bug issue reproducing balance/selection by list
   position with two members reordered between load and action; verify the issue
   states expected vs actual, owned/prohibited paths, and focused validation.
 - [x] 8.2 Fix by selecting via stable `memberId` and add a failing-before,
@@ -85,7 +85,7 @@
 
 ## 9. GH-AW and evidence reconstruction (owner: delivery; depends on 8)
 
-- [ ] 9.1 Add one narrowly safe GH-AW (release-readiness or evidence comment)
+- [x] 9.1 Add one narrowly safe GH-AW (release-readiness or evidence comment)
   that reads real capstone evidence and produces exactly one safe output with no
   approval/merge/deploy authority; verify a real run emits one safe output.
 - [ ] 9.2 Perform a transcript-free evidence reconstruction from the parent
@@ -101,10 +101,21 @@ CI/deploy workflows, and AVM infrastructure. `npm run check` passes (lint,
 typecheck, 31 tests, build). The list-position regression is covered by the
 "is independent of list position" case in `tests/domain.test.ts`.
 
+Delivered on the KsAmJ fork (same-repo PRs, CI green, no fork-approval gate):
+
+- Specification PR #2 (OpenSpec change artifacts) merged to `main`.
+- Implementation PR #1 (app, tests, infra, CI/deploy workflows) merged to `main`.
+- 8.1 Defect issue #3 filed (expected vs actual, owned/prohibited paths, focused
+  validation); the failing-before/passing-after regression from 8.2 is merged.
+- 9.1 Release-readiness GH-AW `capstone-rewards-readiness` authored, compiled
+  (`gh aw compile`), and merged via PR #4. Source and `.lock.yml` are in sync;
+  read-only scope with exactly one `add-comment` safe output and no
+  approval/merge/deploy/edit authority. A real run fires on the next capstone
+  pull request (requires the Copilot engine token configured on the repo).
+
 Pending live execution (require authenticated Azure/GitHub, not available in the
 authoring environment):
 
 - 7.3 Deploy and capture live evidence (needs Azure OIDC + protected environment).
-- 8.1 File the bounded defect issue (workshop exercise; regression already covered).
-- 9.1 Run a narrowly safe GH-AW and emit one safe output.
-- 9.2 Transcript-free evidence reconstruction across the delivered artifacts.
+- 9.2 Transcript-free evidence reconstruction (run after 7.3 deploy evidence and
+  a real 9.1 GH-AW run exist, so every link in the chain resolves).
