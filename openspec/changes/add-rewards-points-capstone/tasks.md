@@ -56,18 +56,18 @@
 
 ## 6. Capstone CI/CD (owner: ci-cd; depends on 3, 4, 5)
 
-- [ ] 6.1 Add capstone-named GitHub Actions workflow(s) that lint, type-check,
+- [x] 6.1 Add capstone-named GitHub Actions workflow(s) that lint, type-check,
   test, build, and smoke-test the app with default read-only permissions; verify
   a real run passes and links from the pull request.
 
 ## 7. AVM infrastructure and OIDC deployment (owner: infra/delivery; depends on 6)
 
-- [ ] 7.1 Author `capstone/rewards-points/infra` Bicep composing pinned AVM
+- [x] 7.1 Author `capstone/rewards-points/infra` Bicep composing pinned AVM
   modules (storage-account + rewards table, Log Analytics, App Insights, App
   Service plan, web/site with system-assigned managed identity) and a Storage
   Table Data Contributor role assignment; verify `az bicep build`/lint and a
   what-if run succeed.
-- [ ] 7.2 Add the OIDC deploy workflow targeting the assigned resource group
+- [x] 7.2 Add the OIDC deploy workflow targeting the assigned resource group
   through a protected environment with `id-token: write` scoped to the deploy
   job only; verify no long-lived secret is referenced and the workflow lints.
 - [ ] 7.3 Deploy and capture evidence: deployed commit, URL, `/healthz`,
@@ -79,7 +79,7 @@
 - [ ] 8.1 File a bounded bug issue reproducing balance/selection by list
   position with two members reordered between load and action; verify the issue
   states expected vs actual, owned/prohibited paths, and focused validation.
-- [ ] 8.2 Fix by selecting via stable `memberId` and add a failing-before,
+- [x] 8.2 Fix by selecting via stable `memberId` and add a failing-before,
   passing-after regression test; verify the regression test fails on the old
   behavior and passes after the fix.
 
@@ -91,3 +91,20 @@
 - [ ] 9.2 Perform a transcript-free evidence reconstruction from the parent
   issue through OpenSpec, task issues, pull requests, checks, deployment, bug
   fix, and GH-AW; verify every link resolves and file follow-ups for any gap.
+
+
+## Status notes
+
+Completed and locally validated (from `capstone/rewards-points/`): scaffold,
+contracts/domain/storage, API + Azure adapter, accessible UI, probes, capstone
+CI/deploy workflows, and AVM infrastructure. `npm run check` passes (lint,
+typecheck, 31 tests, build). The list-position regression is covered by the
+"is independent of list position" case in `tests/domain.test.ts`.
+
+Pending live execution (require authenticated Azure/GitHub, not available in the
+authoring environment):
+
+- 7.3 Deploy and capture live evidence (needs Azure OIDC + protected environment).
+- 8.1 File the bounded defect issue (workshop exercise; regression already covered).
+- 9.1 Run a narrowly safe GH-AW and emit one safe output.
+- 9.2 Transcript-free evidence reconstruction across the delivered artifacts.
