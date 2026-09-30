@@ -1,0 +1,99 @@
+name: Capstone Rewards CI
+
+on:
+  pull_request:
+    paths:
+      - "capstone/rewards-points/**"
+      - ".github/workflows/capstone-rewards-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "capstone/rewards-points/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: capstone/rewards-points
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+          cache: npm
+          cache-dependency-path: capstone/rewards-points/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Type-check
+        run: npm run typecheck
+      - name: Test
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Run health, readiness, and API smoke checks
+        shell: bash
+        env:
+          PORT: "3000"
+          STORAGE_BACKEND: memory
+          SEED_DATA: "true"
+        run: |
+          set -euo pipefail
+          npm start > application.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; cat application.log' EXIT
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:3000/healthz >/dev/null; then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "Application exited before becoming healthy."
+              exit 1
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "Health endpoint did not become ready within 30 seconds."
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl --fail --silent --show-error http://127.0.0.1:3000/readyz >/dev/null
+          curl --fail --silent --show-error http://127.0.0.1:3000/api/transactions >/dev/null
+
+          transaction_id="$(
+            curl --fail --silent --show-error \
+              --request POST \
+              --header "Content-Type: application/json" \
+              --data '{"memberId":"mbr-ada","points":100,"reason":"CI smoke"}' \
+              http://127.0.0.1:3000/api/transactions |
+              jq -r '.transaction.id // empty'
+          )"
+          if [ -z "$transaction_id" ]; then
+            echo "Transaction creation smoke test did not return an ID."
+            exit 1
+          fi
+          balance="$(
+            curl --fail --silent --show-error \
+              http://127.0.0.1:3000/api/members/mbr-ada/balance |
+              jq -r '.balance // empty'
+          )"
+          if [ "$balance" -lt 100 ]; then
+            echo "Balance smoke test expected at least 100 and received '$balance'."
+            exit 1
+          fi
+      - name: Upload smoke diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capstone-rewards-smoke-diagnostics
+          path: capstone/rewards-points/application.log
+          if-no-files-found: ignore

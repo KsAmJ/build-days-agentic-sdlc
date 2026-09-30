@@ -1,0 +1,85 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  max-width: 48rem;
+  margin-inline: auto;
+}
+
+h1 {
+  margin-block-end: 0.25rem;
+}
+
+form {
+  display: grid;
+  gap: 0.75rem;
+  margin-block: 1.5rem;
+}
+
+label {
+  display: grid;
+  gap: 0.25rem;
+  font-weight: 600;
+}
+
+input,
+select,
+button {
+  font: inherit;
+  padding: 0.5rem;
+}
+
+button {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.field-error {
+  color: #b00020;
+  font-weight: 400;
+}
+
+.status {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid currentColor;
+  border-radius: 0.25rem;
+}
+
+.status-success {
+  color: #0b6b3a;
+}
+
+.status-error {
+  color: #b00020;
+}
+
+.balance {
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.5rem;
+  border-block-end: 1px solid #8884;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
